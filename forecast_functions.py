@@ -31,15 +31,7 @@ def make_forecast_by_strategy(info, sample, mode, dates,
     elif strategy == 'Recursive':
         info.forecast['last_iter'] = False
 
-        if dp_df.at[dp_index, 'save_mlr_components'] and method_name == 'fourier_mlr':
-            temp_result = pd.DataFrame(columns=['ds', 'y_pred',
-                                                fourier_mlr_columns['fourier'],
-                                                fourier_mlr_columns['trend'],
-                                                fourier_mlr_columns['level'],
-                                                fourier_mlr_columns['mlr']])
-
-        else:
-            temp_result = pd.DataFrame(columns=['ds', 'y_pred'])
+        temp_result = pd.DataFrame(columns=['ds', 'y_pred'])
 
         forecasting_step = dp_df.at[dp_index, 'forecasting_step']
         number_of_cycles = dp_df.at[dp_index, 'number_of_cycles']
@@ -271,12 +263,12 @@ def get_cold_result(info,
 
 
 def create_empty_forecast(info, group_by_columns, quality_file):
-    cf_info = info.output['cf_info']
-    cf_columns = cf_info['group_columns'] + [cf_info['cf_column'],
-                                             cf_info['t_value_column'],
-                                             cf_info['mlr_coefficient_column']]
-    cf_out_df = pd.DataFrame(columns=[cf_columns])
-    info.output['cf_info']['df'] = cf_out_df
+    # cf_info = info.output['cf_info']
+    # cf_columns = cf_info['group_columns'] + [cf_info['cf_column'],
+    #                                          cf_info['t_value_column'],
+    #                                          cf_info['mlr_coefficient_column']]
+    # cf_out_df = pd.DataFrame(columns=[cf_columns])
+    # info.output['cf_info']['df'] = cf_out_df
     prepare_save_result(info, group_by_columns, pd.DataFrame(), pd.DataFrame(), quality_file)
 
 
@@ -310,9 +302,6 @@ def create_constant_forecast(info,
     result['y_pred'] = sample.at[min(sample.index), 'y']
     dp_df = info.source['detailed_preferences']['df']
     dp_index = dp_df[dp_df['key'] == group.key].index[0]
-    if dp_df.at[dp_index, 'save_mlr_components']:
-        cols = info.forecast['fourier_mlr_columns']
-        result[[cols['fourier'], cols['trend'], cols['level'], cols['mlr']]] = sample.at[min(sample.index), 'y']
 
     message = 'Ошибка исходных данных'
     message_detailed += ('Исходные данные полностью или частично состоят из одинаковых значений, '

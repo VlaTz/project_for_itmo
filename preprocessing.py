@@ -43,27 +43,6 @@ def generate_features(info,
 
     sample = pd.concat([sample, forecast_df[1:]]).reset_index(drop=True)
 
-    sample = generate_features_date(info, sample, key, 'ds')
-    if dp_df['use_source_default']:
-        sample = generate_features_target_default(sample, dates, dp_df['amount_of_pruning'])
-    if dp_df['use_source_global_corr']:
-        sample = generate_defined_features(info, sample, key, dates)
-
-    if info.forecast['use_causal_factors']:
-        sample = generate_features_causal(info, sample, key)
-
-    # Удалим столбцы, где CF - константа. В модели прогнозирования они бесполезны
-    features = [col for col in sample.columns if col not in ['key', 'ds', 'y']]
-    condition = (sample[features].nunique().eq(1))
-    drop_cols = [index for index in condition.index if condition[index] == True]
-    sample = sample.drop(drop_cols, axis=1)
-    features = [col for col in sample.columns if col not in ['key', 'ds', 'y']]
-
-    if features:
-        if not dp_df['scaling_strategy_features'] == "Don't scale":
-            sample = scale_features(info, sample, key)
-
-        sample = select_features(info, sample, key)
     train = sample[:-dates.n_periods]  # Обучающая выборка
     # Тестовая выборка включает обучающую часть, для получения прогноза по фактическому периоду
     test = sample
@@ -411,30 +390,23 @@ def select_features_pca(info, sample, key, unique_cf=[],
 def scale_features(info, sample, key):
     dp_df = get_forecast_info(info, key)
     scaling_strategy = dp_df['scaling_strategy_features']
-    cf = info.source['causal_factors']['scaling']
 
-    if 'empty' not in cf.get(key, ['empty']):
-        model = cf[key]['model']
-        unique_cf = cf[key]['unique_cf']
-        transformed_features = model.transform(sample[unique_cf])
-        sample[unique_cf] = transformed_features
+    unique_cf = [col for col in sample.columns if col not in ['key', 'ds', 'y']]
+    parameters = dp_df['scaling_parameters_features']
+    if scaling_strategy == "Standard":
+        model = StandardScaler(**parameters)
+    elif scaling_strategy == "MinMax":
+        model = MinMaxScaler(**parameters)
+    elif scaling_strategy == "Power Transform":
+        model = PowerTransformer(**parameters)
     else:
-        unique_cf = [col for col in sample.columns if col not in ['key', 'ds', 'y']]
-        parameters = dp_df['scaling_parameters_features']
-        if scaling_strategy == "Standard":
-            model = StandardScaler(**parameters)
-        elif scaling_strategy == "MinMax":
-            model = MinMaxScaler(**parameters)
-        elif scaling_strategy == "Power Transform":
-            model = PowerTransformer(**parameters)
-        else:
-            logging.warning(
-                f'Группа {key}. Выбрана некорректная стратегия масштабирования признаков - {scaling_strategy}'
-                '. Доступные стратегии: ["Standard", "MinMax", "Power Transform", "Don\'t scale"].'
-                'Данные масштабироваться не будут.')
-            return sample
-        model.fit(sample[unique_cf])
-        cf[key] = {'model': model, 'unique_cf': unique_cf}
+        logging.warning(
+            f'Группа {key}. Выбрана некорректная стратегия масштабирования признаков - {scaling_strategy}'
+            '. Доступные стратегии: ["Standard", "MinMax", "Power Transform", "Don\'t scale"].'
+            'Данные масштабироваться не будут.')
+        return sample
+    model.fit(sample[unique_cf])
+
     transformed_features = model.transform(sample[unique_cf])
     sample[unique_cf] = transformed_features
     return sample

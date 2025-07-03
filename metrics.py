@@ -1,5 +1,4 @@
 import numpy as np
-from sklearn.metrics import make_scorer
 from statsmodels.stats.stattools import durbin_watson
 
 

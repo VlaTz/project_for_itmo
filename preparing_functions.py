@@ -15,10 +15,7 @@ def detect_methods(info, key):
     dp_df, dp_index = get_forecast_info(info, key, get_index=True)
     selected_models = dp_df['selected_models']
     all_methods = info.forecast['all_methods']
-    if dp_df['use_fast_forecasting']:
-        func_name = ['fourier_mlr']
-    else:
-        func_name = [method for method in selected_models if method in all_methods]
+    func_name = [method for method in selected_models if method in all_methods]
 
     if not func_name:
         logging.warning(f'В настройках не обнаружены методы прогнозирования. '
@@ -219,14 +216,11 @@ def prepare_detailed_preferences(info, dp_df):
     start = time()
     dp = info.source['detailed_preferences']
 
-    updated_cols = ['quality_metric', 'eval_metric', 'min_components', 'max_components',
-                    'trend_correct', 'save_mlr_components', 'trend_discount_factor', 'time_weight_coef',
-                    'scaling_strategy_target', 'scaling_parameters_target',
-                    'scaling_strategy_features', 'scaling_parameters_features',
-                    'selection_strategy', 'outlier_threshold', 'f_to_leave', 'f_to_enter',
-                    'use_day_of_week', 'use_month_of_year', 'use_source_default', 'use_source_global_corr',
-                    'periods_to_forecast',
-                    'start_history', 'end_history', 'min_history_periods', 'selected_models', 'use_fast_forecasting',
+    updated_cols = ['quality_metric', 'eval_metric', 'time_weight_coef',
+                    'scaling_strategy_target', 'outlier_threshold',
+                    'periods_to_forecast', 'scaling_parameters_target',
+                    'start_history', 'end_history', 'min_history_periods', 'selected_models',
+
                     # Статистические параметры:
                     'rol_mean_min_window_size', 'rol_mean_max_window_size', 'exp_smoothing_min_alpha',
                     'exp_smoothing_max_alpha', 'exp_smoothing_step', 'holt_min_alpha', 'holt_max_alpha',
@@ -243,12 +237,10 @@ def prepare_detailed_preferences(info, dp_df):
     new_names = {value: key for key, value in dp.items() if key in updated_cols}
     dp_df = dp_df.rename(columns=new_names)
 
-    int_cols = ['min_components', 'max_components', 'trend_correct', 'save_mlr_components', 'use_day_of_week',
-                'use_month_of_year', 'periods_to_forecast', 'min_history_periods', 'use_fast_forecasting'
-                ]
-    float_cols = ['trend_discount_factor', 'time_weight_coef', 'f_to_leave', 'f_to_enter', 'outlier_threshold']
+    int_cols = ['periods_to_forecast', 'min_history_periods']
+    float_cols = ['time_weight_coef', 'outlier_threshold']
     json_cols = ['eval_metric', 'selected_models', 'holt_winters_trend_types', 'holt_winters_seasonal_types',
-                 'scaling_parameters_target', 'scaling_parameters_features']
+                 'scaling_parameters_target']
 
     dp_df[int_cols] = dp_df[int_cols].astype(int)
     dp_df[float_cols] = dp_df[float_cols].astype(float)
@@ -572,7 +564,6 @@ def create_info(input_info):
             'append_model_estimation_for_known_periods':
                 config_df['Включить значения модели по фактическому периоду'],
             'negative_values_acceptable': False,
-            'trend_smoothing_method': config_df['Метод сглаживания тренда'],
             'last_iter': True,
             'fourier_mlr_columns': {},
             'quality_message': {},
@@ -580,11 +571,9 @@ def create_info(input_info):
             'specified_parameters': {},
             'start_time_subset': config_df['Начало выборки времени'],
             'end_time_subset': config_df['Конец выборки времени'],
-            'all_methods': ['prophet', 'sarima', 'catboost', 'random_forest', 'fourier', 'exponential_smoothing',
-                            'mlr', 'fourier_mlr', 'fourier_first', 'fourier_second', 'symfit_fourier', 'fourier_mlr',
-                            'rol_mean', 'exp_smoothing', 'holt', 'holt_winters', 'polynomial', 'theil_sen', 'ransac',
-                            'huber', 'lasso', 'ridge', 'elastic_net', 'croston_tsb', 'hyperbolic', 'const',
-                            'linear_regression'],
+            'all_methods': ['linear_regression', 'theil_sen', 'ransac', 'lasso', 'ridge', 'elastic_net', 'polynomial',
+                            'huber', 'exp_smoothing', 'holt', 'holt_winters', 'rol_mean', 'croston_tsb', 'hyperbolic',
+                            'const'],
             'detected_methods': {},
         },
         'output': {
@@ -616,10 +605,6 @@ def create_info(input_info):
                 'error_description_column_name': config_df['Название колонки описания ошибки прогноза']},
         },
     }
-
-    if 'Использовать мультипроцессинг для фурье' in config_info.df.columns:
-        file_info['forecast']['multiprocessed_fourier'] = config_info.df.loc[
-            0, 'Использовать мультипроцессинг для фурье']
 
     if file_info.get('correlation'):
         file_info['source']['global_correlation'] = {
@@ -702,11 +687,6 @@ def create_info(input_info):
             'df': pd.DataFrame(),
         }
 
-    file_info['forecast']['fourier_mlr_columns'] = {'fourier': config_df['Колонка Фурье'],
-                                                    'trend': config_df['Колонка тренда'],
-                                                    'level': config_df['Колонка уровня'],
-                                                    'mlr': config_df['Колонка MLR']
-                                                    }
 
     detailed_preferences = input_info['detailed_preferences']
     res_check = check_file_existence({'detailed_preferences_path': detailed_preferences}, ignore_additional=False)
@@ -724,29 +704,13 @@ def create_info(input_info):
             'forecasting_step': config_df['Колонка уникального шага прогнозирования'],
             'quality_metric': config_df['Колонка уникальной метрики качества'],
             'eval_metric': config_df['Колонка уникальных метрик подбора гиперпараметров'],
-            'min_components': config_df['Колонка уникальной Min seasonal terms'],
-            'max_components': config_df['Колонка уникальной Max seasonal terms'],
-            'trend_correct': config_df['Колонка сглаживания тренда'],
-            'trend_discount_factor': config_df['Колонка коэффициента сглаживания тренда'],
-            'save_mlr_components': config_df['Колонка сохранения составляющих ряда'],
             'time_weight_coef': config_df['Колонка коэффициента затухания ошибки со временем'],
             'outlier_threshold': config_df['Колонка значения outlier threshold'],
 
             # Генерация, масштабирование и отбор признаков
             'scaling_strategy_target': config_df['Колонка стратегии масштабирования целевого признака'],
             'scaling_parameters_target': config_df['Колонка параметров масштабирования целевого признака'],
-            'scaling_strategy_features': config_df['Колонка стратегии масштабирования дополнительных признаков'],
-            'scaling_parameters_features': config_df['Колонка параметров масштабирования дополнительных признаков'],
-            'selection_strategy': config_df['Колонка стратегии отбора дополнительных признаков'],
-            'f_to_leave': config_df['Колонка F to leave (для Backward)'],
-            'f_to_enter': config_df['Колонка F to enter (для Forward)'],
-            'use_day_of_week': config_df['Колонка использовать дни недели'],
-            'use_month_of_year': config_df['Колонка использовать месяцы года'],
-            'use_source_default': config_df['Колонка использовать признаки из исходного ряда по умолчанию'],
-            'use_source_global_corr': config_df[
-                'Колонка использовать признаки из исходного ряда по значимости на всех группах'],
             'selected_models': config_df['Колонка выбранных моделей'],
-            'use_fast_forecasting': config_df['Колонка использовать быстрый прогноз'],
 
             # Параметры для статистических методов
             'rol_mean_min_window_size': config_df['Скользящее среднее - размер окна минимум'],

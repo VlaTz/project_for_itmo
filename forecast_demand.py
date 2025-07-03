@@ -27,14 +27,6 @@ def prepare_for_training(info):
     dp_df = load_and_prepare_data(info, 'detailed_preferences', info.source['detailed_preferences']['group_column'],
                                   True)
     prepare_detailed_preferences(info, dp_df)
-    # Подготовим фрейм с Causal Factors при необходимости
-    prepare_correlation(info)
-
-    if info.forecast['use_causal_factors']:
-        cf_df = load_and_prepare_data(info, 'causal_factors', info.source['causal_factors']['group_column'],
-                                      need_key=True)
-        cf_desc_df = load_and_prepare_data(info, 'cf_desc', info.source['cf_desc']['features_col'])
-        prepare_causal_factors(info, cf_df, cf_desc_df)
 
     quality = create_quality_file(info)
     fact_df = load_and_prepare_data(info, 'fact', info.source['group_by_columns'])

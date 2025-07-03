@@ -1,21 +1,22 @@
-import logging
-from time import time
-
-import numpy as np
+# -*- coding: utf-8 -*-
 import pandas as pd
-import sklearn
-from sklearn.linear_model import LinearRegression, TheilSenRegressor, RANSACRegressor, HuberRegressor, Lasso, Ridge, \
-    ElasticNet
-
+import numpy as np
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from statsmodels.tsa.api import SimpleExpSmoothing, Holt
+from sklearn.linear_model import (LinearRegression, TheilSenRegressor, RANSACRegressor, HuberRegressor, Lasso, Ridge,
+                                  ElasticNet)
 from sklearn.preprocessing import PolynomialFeatures
-from statsmodels.tsa.api import SimpleExpSmoothing, Holt, ExponentialSmoothing
-
+import logging
+from sklearn.exceptions import ConvergenceWarning
+from time import time
 from metrics import calculate_quality
 from service_functions import Mode, get_forecast_info, tren_coeff_find
 
 
 def seasonal_coefficients(ts, timestamps, time_step, timestamps_res):
     mean_sales = np.mean(ts.values)
+    marks_res = {}
+    marks = {}
     if time_step == 'YS':
         marks = timestamps.dt.year
         marks_res = timestamps_res.year
@@ -42,24 +43,26 @@ def seasonal_coefficients(ts, timestamps, time_step, timestamps_res):
         dict_seasonality[timestamp] = dict_seasonality.get(timestamp, 1)
     return dict_seasonality, marks_res
 
-
 def create_x_train_pred(train_len, len_pred):
+    """Create arrays for training and prediction."""
+    x_train = np.arange(train_len).reshape(-1, 1)
+    x_pred = np.arange(train_len + len_pred).reshape(-1, 1)
     ts_res = pd.Series(index=range(train_len + len_pred), dtype='float64')
-    x_train = np.array([i for i in range(train_len)]).reshape(-1, 1)
-    x_pred = np.array([i for i in range(train_len + len_pred)]).reshape(-1, 1)
     return ts_res, x_train, x_pred
 
 
-def rol_mean(ts, n_predict, ws):
-    """
-    Создает скользящее среднее, формирует список компонентов
+def _apply_seasonality(ts_res, ts, timestamps, time_step, n_predict):
+    """Helper function to apply seasonal coefficients."""
+    timestamps_res = pd.date_range(start=timestamps[0], freq=time_step, periods=len(ts_res))
+    dict_seasonality, marks_res = seasonal_coefficients(ts, timestamps, time_step, timestamps_res)
+    df = pd.DataFrame({'y_pred': ts_res, 'indexes': marks_res})
+    df['y_pred'] = df['y_pred'] * df['indexes'].map(dict_seasonality)
+    return df['y_pred'].reset_index(drop=True)
 
-    :param ts: Временной ряд
-    :param n_predict: Количество периодов для прогнозирования
-    :param ws: Размер окна
-    :return: Прогноз
-    """
-    n = len(ts.index)
+
+def rol_mean(ts, n_predict, ws):
+    """Rolling mean forecast."""
+    n = len(ts)
     ts_res = pd.Series(index=range(n + n_predict), dtype='float64')
     ts_copy = ts_res.copy()
     ts_copy.loc[ts.index] = ts.values
@@ -69,175 +72,112 @@ def rol_mean(ts, n_predict, ws):
 
 
 def exp_smooth(ts, n_predict, alpha):
-    """
-    Создает экспоненциальное сглаживание, формирует список компонентов
-
-    :param ts: Временной ряд
-    :param n_predict: Количество периодов для прогнозирования
-    :param alpha: Коэффициент сглаживания
-    :return: Прогноз
-
-    """
-    n = len(ts.index)
+    """Exponential smoothing forecast."""
+    n = len(ts)
     ts_res = pd.Series(index=range(n + n_predict), dtype='float64')
-    fit = SimpleExpSmoothing(ts.fillna(0), initialization_method='heuristic').fit(smoothing_level=alpha,
-                                                                                  optimized=False)
-    ts_res.loc[range(n + n_predict)] = fit.forecast(n + n_predict).to_list()
+    fit = SimpleExpSmoothing(ts.fillna(0), initialization_method='heuristic').fit(smoothing_level=alpha, optimized=False)
+    ts_res.loc[:] = fit.forecast(len(ts_res)).tolist()
     return ts_res
 
 
 def holt(timestamps, ts, alpha, beta, n_predict, time_step):
-    n = len(ts.index)
+    """Holt's linear trend method with seasonality."""
+    n = len(ts)
     ts_res = pd.Series(index=range(n + n_predict), dtype='float64')
     fit = Holt(ts.fillna(0)).fit(smoothing_level=alpha, smoothing_trend=beta, optimized=False)
-    ts_res.loc[range(n + n_predict)] = fit.forecast(n + n_predict).to_list()
-    timestamps_res = pd.date_range(start=timestamps[0], freq=time_step, periods=len(ts_res))
-    dict_seasonality, marks_res = seasonal_coefficients(ts, timestamps, time_step, timestamps_res)
-    df = pd.DataFrame({'y_pred': ts_res, 'indexes': marks_res})
-    df.y_pred = df.apply(lambda x: x.y_pred * dict_seasonality[x.indexes], axis=1)
-    return df.y_pred.reset_index(drop=True), {'alpha': alpha, 'beta': beta}
+    ts_res.loc[:] = fit.forecast(len(ts_res)).tolist()
+    result = _apply_seasonality(ts_res, ts, timestamps, time_step, n_predict)
+    return result, {'alpha': alpha, 'beta': beta}
 
 
 def holt_winters(ts, period, trend, seasonal, n_predict):
+    """Holt-Winters seasonal method."""
+    n = len(ts)
     try:
-        n = len(ts.index)
         ts_res = pd.Series(index=range(n + n_predict), dtype='float64')
         ts_copy = ts.copy()
-        ts_copy.fillna(0, inplace=True)
-        ts_copy[ts_copy <= 0] = 0.0001
+        ts_copy = ts_copy.fillna(0).clip(lower=0.0001)
         fit = ExponentialSmoothing(ts_copy, seasonal_periods=period, trend=trend, seasonal=seasonal).fit()
-        ts_res.loc[range(n + n_predict)] = fit.forecast(n + n_predict + 1).to_list()[1:]
+        ts_res.loc[:] = fit.forecast(len(ts_res))[1:].tolist()
         return ts_res, {'period': period, 'trend': trend, 'seasonal': seasonal}
     except FloatingPointError as err:
-        logging.debug(f'Ошибка модели Хольта-Винтерса - {err}, параметры: сезонность = {seasonal}, тренд = {trend}, '
-                      f'период = {period}')
-        ts_res[np.isnan(ts_res)] = np.inf
-        return ts_res, {'period': period, 'trend': trend, 'seasonal': seasonal}
+        logging.debug(f'Holt-Winters error - {err}, params: seasonal={seasonal}, trend={trend}, period={period}')
+        return pd.Series(np.inf, index=range(n + n_predict)), {'period': period, 'trend': trend, 'seasonal': seasonal}
+
+
+def _regression_model(timestamps, ts, n_predict, time_step, model, degree=None):
+    """Generic regression model helper."""
+    ts_res, x_train, x_pred = create_x_train_pred(len(ts), n_predict)
+
+    if degree:
+        poly = PolynomialFeatures(degree, include_bias=False)
+        x_train = poly.fit_transform(x_train)
+        x_pred = poly.transform(x_pred)
+
+    model.fit(x_train, ts.fillna(0))
+    ts_res.loc[:] = model.predict(x_pred)
+    return _apply_seasonality(ts_res, ts, timestamps, time_step, n_predict)
 
 
 def linear_regression(timestamps, ts, n_predict, time_step):
-    ts_res, x_train, x_pred = create_x_train_pred(len(ts.index), n_predict)
-    model = LinearRegression()
-    model.fit(x_train, ts.fillna(0))
-    ts_res.loc[ts_res.index] = model.predict(x_pred).tolist()
-    timestamps_res = pd.date_range(start=timestamps[0], freq=time_step, periods=len(ts_res))
-    dict_seasonality, marks_res = seasonal_coefficients(ts, timestamps, time_step, timestamps_res)
-    df = pd.DataFrame({'y_pred': ts_res, 'indexes': marks_res})
-    df.y_pred = df.apply(lambda x: x.y_pred * dict_seasonality[x.indexes], axis=1)
-    return df.y_pred.reset_index(drop=True)
+    """Linear regression forecast."""
+    return _regression_model(timestamps, ts, n_predict, time_step, LinearRegression())
 
 
 def polynomial_regression(timestamps, ts, degree, n_predict, time_step):
-    ts_res, x_train, x_pred = create_x_train_pred(len(ts.index), n_predict)
-    poly = PolynomialFeatures(degree, include_bias=False)
-    poly_features = poly.fit_transform(x_train)
-    model = LinearRegression()
-    model.fit(poly_features, ts.fillna(0))
-    ts_res.loc[ts_res.index] = model.predict(poly.fit_transform(x_pred)).tolist()
-    timestamps_res = pd.date_range(start=timestamps[0], freq=time_step, periods=len(ts_res))
-    dict_seasonality, marks_res = seasonal_coefficients(ts, timestamps, time_step, timestamps_res)
-    df = pd.DataFrame({'y_pred': ts_res, 'indexes': marks_res})
-    df.y_pred = df.apply(lambda x: x.y_pred * dict_seasonality[x.indexes], axis=1)
-    return df.y_pred.reset_index(drop=True)
+    """Polynomial regression forecast."""
+    return _regression_model(timestamps, ts, n_predict, time_step, LinearRegression(), degree)
 
 
 def theil_sen_regression(timestamps, ts, degree, n_predict, time_step):
+    """Theil-Sen regression forecast."""
     try:
-        ts_res, x_train, x_pred = create_x_train_pred(len(ts.index), n_predict)
-        poly = PolynomialFeatures(degree, include_bias=False)
-        poly_features = poly.fit_transform(x_train)
-        model = TheilSenRegressor(random_state=42)
-        model.fit(poly_features, ts.fillna(0))
-        ts_res.loc[ts_res.index] = model.predict(poly.fit_transform(x_pred)).tolist()
-        timestamps_res = pd.date_range(start=timestamps[0], freq=time_step, periods=len(ts_res))
-        dict_seasonality, marks_res = seasonal_coefficients(ts, timestamps, time_step, timestamps_res)
-        df = pd.DataFrame({'y_pred': ts_res, 'indexes': marks_res})
-        df.y_pred = df.apply(lambda x: x.y_pred * dict_seasonality[x.indexes], axis=1)
-        return df.y_pred.reset_index(drop=True)
-    except sklearn.exceptions.ConvergenceWarning:
-        return pd.Series([-np.inf for i in range(len(ts.index) + n_predict)])
-
+        return _regression_model(timestamps, ts, n_predict, time_step, TheilSenRegressor(random_state=42), degree)
+    except ConvergenceWarning:
+        return pd.Series(-np.inf, index=range(len(ts) + n_predict))
 
 
 def ransac_regression(timestamps, ts, degree, n_predict, time_step):
-    ts_res, x_train, x_pred = create_x_train_pred(len(ts.index), n_predict)
-    poly = PolynomialFeatures(degree, include_bias=False)
-    poly_features = poly.fit_transform(x_train)
-    model = RANSACRegressor(random_state=42)
-    model.fit(poly_features, ts.fillna(0))
-    ts_res.loc[ts_res.index] = model.predict(poly.fit_transform(x_pred)).tolist()
-    timestamps_res = pd.date_range(start=timestamps[0], freq=time_step, periods=len(ts_res))
-    dict_seasonality, marks_res = seasonal_coefficients(ts, timestamps, time_step, timestamps_res)
-    df = pd.DataFrame({'y_pred': ts_res, 'indexes': marks_res})
-    df.y_pred = df.apply(lambda x: x.y_pred * dict_seasonality[x.indexes], axis=1)
-    return df.y_pred.reset_index(drop=True)
+    """RANSAC regression forecast."""
+    return _regression_model(timestamps, ts, n_predict, time_step, RANSACRegressor(random_state=42), degree)
 
 
 def huber_regression(timestamps, ts, degree, n_predict, time_step):
-    ts_res, x_train, x_pred = create_x_train_pred(len(ts.index), n_predict)
-    poly = PolynomialFeatures(degree, include_bias=False)
-    poly_features = poly.fit_transform(x_train)
-    model = HuberRegressor()
-    model.fit(poly_features, ts.fillna(0))
-    ts_res.loc[ts_res.index] = model.predict(poly.fit_transform(x_pred)).tolist()
-    timestamps_res = pd.date_range(start=timestamps[0], freq=time_step, periods=len(ts_res))
-    dict_seasonality, marks_res = seasonal_coefficients(ts, timestamps, time_step, timestamps_res)
-    df = pd.DataFrame({'y_pred': ts_res, 'indexes': marks_res})
-    df.y_pred = df.apply(lambda x: x.y_pred * dict_seasonality[x.indexes], axis=1)
-    return df.y_pred.reset_index(drop=True)
+    """Huber regression forecast."""
+    return _regression_model(timestamps, ts, n_predict, time_step, HuberRegressor(), degree)
 
 
 def lasso_regression(timestamps, ts, alpha, n_predict, time_step):
-    ts_res, x_train, x_pred = create_x_train_pred(len(ts.index), n_predict)
-    model = Lasso(alpha=alpha)
-    model.fit(x_train, ts.fillna(0))
-    ts_res.loc[ts_res.index] = model.predict(x_pred).tolist()
-    timestamps_res = pd.date_range(start=timestamps[0], freq=time_step, periods=len(ts_res))
-    dict_seasonality, marks_res = seasonal_coefficients(ts, timestamps, time_step, timestamps_res)
-    df = pd.DataFrame({'y_pred': ts_res, 'indexes': marks_res})
-    df.y_pred = df.apply(lambda x: x.y_pred * dict_seasonality[x.indexes], axis=1)
-    return df.y_pred.reset_index(drop=True)
+    """Lasso regression forecast."""
+    return _regression_model(timestamps, ts, n_predict, time_step, Lasso(alpha=alpha) )
 
 
 def ridge_regression(timestamps, ts, alpha, n_predict, time_step):
-    ts_res, x_train, x_pred = create_x_train_pred(len(ts.index), n_predict)
-    model = Ridge(alpha=alpha)
-    model.fit(x_train, ts.fillna(0))
-    ts_res.loc[ts_res.index] = model.predict(x_pred).tolist()
-    timestamps_res = pd.date_range(start=timestamps[0], freq=time_step, periods=len(ts_res))
-    dict_seasonality, marks_res = seasonal_coefficients(ts, timestamps, time_step, timestamps_res)
-    df = pd.DataFrame({'y_pred': ts_res, 'indexes': marks_res})
-    df.y_pred = df.apply(lambda x: x.y_pred * dict_seasonality[x.indexes], axis=1)
-    return df.y_pred.reset_index(drop=True)
+    """Ridge regression forecast."""
+    return _regression_model(timestamps, ts, n_predict, time_step, Ridge(alpha=alpha))
 
 
 def elastic_net(timestamps, ts, alpha, l1, n_predict, time_step):
-    ts_res, x_train, x_pred = create_x_train_pred(len(ts.index), n_predict)
-    model = ElasticNet(alpha=alpha, l1_ratio=l1)
-    model.fit(x_train, ts.fillna(0))
-    ts_res.loc[ts_res.index] = model.predict(x_pred).tolist()
-    timestamps_res = pd.date_range(start=timestamps[0], freq=time_step, periods=len(ts_res))
-    dict_seasonality, marks_res = seasonal_coefficients(ts, timestamps, time_step, timestamps_res)
-    df = pd.DataFrame({'y_pred': ts_res, 'indexes': marks_res})
-    df.y_pred = df.apply(lambda x: x.y_pred * dict_seasonality[x.indexes], axis=1)
-    return df.y_pred.reset_index(drop=True), {'alpha': alpha, 'l1_ratio': l1}
+    """ElasticNet regression forecast."""
+    result = _regression_model(timestamps, ts, n_predict, time_step, ElasticNet(alpha=alpha, l1_ratio=l1))
+    return result, {'alpha': alpha, 'l1_ratio': l1}
 
 
 def croston_tsb(timestamps, ts, alpha, beta, n_predict, time_step):
-    d = np.array(ts)
+    """Croston TSB method for intermittent demand forecasting."""
+    d = ts.values
     cols = len(d)
     d = np.append(d, [np.nan] * n_predict)
 
-    # Уровень(a), Вероятность(p), Прогноз(f)
-    a, p, f = np.full((3, cols + n_predict + 1), np.nan)
+    a = np.full(cols + n_predict + 1, np.nan)
+    p = np.full_like(a, np.nan)
+    f = np.full_like(a, np.nan)
 
-    # Инициализация
     first_occurrence = np.argmax(d[:cols] > 0)
     a[0] = d[first_occurrence]
     p[0] = 1 / (1 + first_occurrence)
     f[0] = p[0] * a[0]
 
-    # Заполнение матриц уровня и вероятности, прогноз
     for t in range(cols):
         if d[t] > 0:
             a[t + 1] = alpha * d[t] + (1 - alpha) * a[t]
@@ -246,55 +186,51 @@ def croston_tsb(timestamps, ts, alpha, beta, n_predict, time_step):
             a[t + 1] = a[t]
             p[t + 1] = (1 - beta) * p[t]
         f[t + 1] = p[t + 1] * a[t + 1]
-    a[cols + 1:cols + n_predict + 1] = a[cols]
-    p[cols + 1:cols + n_predict + 1] = p[cols]
-    f[cols + 1:cols + n_predict + 1] = f[cols]
 
-    ts_res = pd.Series(index=range(cols + n_predict), dtype='float64')
-    ts_res.loc[ts_res.index] = f[1:]
+    a[cols + 1:] = a[cols]
+    p[cols + 1:] = p[cols]
+    f[cols + 1:] = f[cols]
+
+    ts_res = pd.Series(f[1:], index=range(cols + n_predict), dtype='float64')
     timestamps_res = pd.date_range(start=timestamps[0], freq=time_step, periods=len(ts_res))
     dict_seasonality, marks_res = seasonal_coefficients(ts, timestamps, time_step, timestamps_res)
     df = pd.DataFrame({'y_pred': ts_res, 'indexes': marks_res})
-    df.loc[cols + 1:cols + n_predict + 1, 'y_pred'] = df.iloc[cols + 1:cols + n_predict + 1].apply(
-        lambda x: x.y_pred * dict_seasonality[x.indexes], axis=1)
+    df.loc[cols + 1:, 'y_pred'] *= df.loc[cols + 1:, 'indexes'].map(dict_seasonality)
 
-    return df.y_pred.reset_index(drop=True), {'alpha': alpha, 'beta': beta}
+    return df['y_pred'].reset_index(drop=True), {'alpha': alpha, 'beta': beta}
 
 
 def hyperbolic_regression(timestamps, ts, n_predict, time_step):
-    n = len(ts.index)
-    ts_res = pd.Series(index=range(n + n_predict), dtype='float64')
-    x_train = np.array([i for i in range(1, n + 1)])
-    x_pred = np.array([i for i in range(1, n + n_predict + 1)])
-    a_1 = (n * np.sum(ts.fillna(0).values / x_train) - np.sum(1 / x_train) * np.sum(ts.fillna(0))) / (
-            n * np.sum(1 / x_train ** 2) - np.sum(1 / x_train) ** 2)
-    a_0 = np.sum(ts.fillna(0)) / n - a_1 * np.sum(1 / x_train) / n
+    """Hyperbolic regression forecast."""
+    n = len(ts)
+    x_train = np.arange(1, n + 1)
+    x_pred = np.arange(1, n + n_predict + 1)
 
-    pred = np.array([a_0 + a_1 / x for x in x_pred])
-    ts_res.loc[ts_res.index] = pred
-    timestamps_res = pd.date_range(start=timestamps[0], freq=time_step, periods=len(ts_res))
-    dict_seasonality, marks_res = seasonal_coefficients(ts, timestamps, time_step, timestamps_res)
-    df = pd.DataFrame({'y_pred': ts_res, 'indexes': marks_res})
-    df.y_pred = df.apply(lambda x: x.y_pred * dict_seasonality[x.indexes], axis=1)
-    return df.y_pred.reset_index(drop=True)
+    sum_1_x = np.sum(1 / x_train)
+    sum_1_x2 = np.sum(1 / x_train ** 2)
+    sum_y = np.sum(ts.fillna(0))
+    sum_y_x = np.sum(ts.fillna(0) / x_train)
+
+    denominator = n * sum_1_x2 - sum_1_x ** 2
+    a1 = (n * sum_y_x - sum_1_x * sum_y) / denominator
+    a0 = (sum_y - a1 * sum_1_x) / n
+
+    ts_res = pd.Series(a0 + a1 / x_pred, index=range(n + n_predict))
+    return _apply_seasonality(ts_res, ts, timestamps, time_step, n_predict)
 
 
 def const(ts, n_predict):
-    n = len(ts.index)
-    ts_res = pd.Series(index=range(n + n_predict), dtype='float64')
-    ts_res.loc[ts_res.index] = [ts.mode().tolist()[0]] * len(ts_res.index)
-    return ts_res
+    """Constant value forecast."""
+    return pd.Series(ts.mode().iloc[0], index=range(len(ts) + n_predict), dtype='float64')
 
 
-def rol_mean_predict(info,
-                     key,
-                     samples,
-                     mode,
-                     dates=None):
+
+def rol_mean_predict(info, key, samples, mode, dates=None):
     """
     Модель на основе скользящего среднего
 
     :param info: Именованный кортеж. Содержит информацию о параметрах прогнозирования;
+    :param key: Ключ пересечения;
     :param samples: Данные для прогнозирования;
     :param dates: Именованный кортеж. Содержит информацию о граничных датах;
     :param mode: Режим прогнозирования;
@@ -311,6 +247,8 @@ def rol_mean_predict(info,
     metric = dp_df['eval_metric'].get('rol_mean', 'WAPE')
 
     sample_index = sample.index.values.reshape(-1, 1)
+    num_components = 0
+    trend_coef = None
 
     if mode == Mode.warm:
         trend_coef = info.forecast['specified_parameters'][key]['rol_mean']['trend_coeff']
@@ -325,7 +263,6 @@ def rol_mean_predict(info,
         trend = trend_coef['a'] * sample_index + trend_coef['b']
         sample.loc[:, 'y'] = sample['y'] - trend.squeeze()
 
-        num_components = 0
         quality = np.inf
 
         for window_size in np.arange(start=min_window_size, stop=max_window_size + step, step=step):
@@ -355,8 +292,7 @@ def rol_mean_predict(info,
                               periods=dates.n_periods + 1)[1:]
 
     prediction = rol_mean(sample['y'], dates.n_periods, num_components)
-    result = pd.DataFrame({'ds': np.append(sample['ds'], future_ds), 'y_pred': prediction})
-    result = result[result['ds'].isin(np.append(sample['ds'], future_ds))]
+    result = prepare_result(sample, future_ds,  prediction)
 
     all_trend = trend_coef['a'] * result.index.values
     level = trend_coef['b']
@@ -371,15 +307,12 @@ def rol_mean_predict(info,
     return result, {'rol_mean': {'window_size': num_components, 'trend_coeff': trend_coef}}, None
 
 
-def exp_smoothing_predict(info,
-                          key,
-                          samples,
-                          mode,
-                          dates=None):
+def exp_smoothing_predict(info, key, samples, mode, dates=None):
     """
     Модель на основе экспоненциального сглаживания
 
     :param info: Именованный кортеж. Содержит информацию о параметрах прогнозирования;
+    :param key: Ключ пересечения;
     :param samples: Данные для прогнозирования;
     :param dates: Именованный кортеж. Содержит информацию о граничных датах;
     :param mode: Режим прогнозирования;
@@ -396,6 +329,7 @@ def exp_smoothing_predict(info,
     metric = dp_df['eval_metric'].get('exp_smoothing', 'WAPE')
 
     sample_index = sample.index.values.reshape(-1, 1)
+    num_components = 0
 
     if mode == Mode.warm:
         trend_coef = info.forecast['specified_parameters'][key]['exp_smoothing']['trend_coeff']
@@ -409,8 +343,6 @@ def exp_smoothing_predict(info,
         trend_coef = tren_coeff_find(sample.y)
         trend = trend_coef['a'] * sample_index + trend_coef['b']
         sample.loc[:, 'y'] = sample['y'] - trend.squeeze()
-
-        num_components = 0
         quality = np.inf
 
         for alpha in np.arange(start=min_alpha, stop=max_alpha + step, step=step):
@@ -440,8 +372,7 @@ def exp_smoothing_predict(info,
                               periods=dates.n_periods + 1)[1:]
 
     prediction = exp_smooth(sample['y'], dates.n_periods, num_components)
-    result = pd.DataFrame({'ds': np.append(sample['ds'], future_ds), 'y_pred': prediction})
-    result = result[result['ds'].isin(np.append(sample['ds'], future_ds))]
+    result = prepare_result(sample, future_ds,  prediction)
 
     all_trend = trend_coef['a'] * result.index.values
     level = trend_coef['b']
@@ -456,15 +387,12 @@ def exp_smoothing_predict(info,
     return result, {'exp_smoothing': {'alpha': num_components, 'trend_coeff': trend_coef}}, None
 
 
-def holt_predict(info,
-                 key,
-                 samples,
-                 mode,
-                 dates=None):
+def holt_predict(info, key, samples, mode, dates=None):
     """
     Модель Хольта
 
     :param info: Именованный кортеж. Содержит информацию о параметрах прогнозирования;
+    :param key: Ключ пересечения;
     :param samples: Данные для прогнозирования;
     :param dates: Именованный кортеж. Содержит информацию о граничных датах;
     :param mode: Режим прогнозирования;
@@ -517,8 +445,7 @@ def holt_predict(info,
 
     prediction, parameters = holt(sample['ds'], sample['y'], parameters['alpha'], parameters['beta'],
                                   dates.n_periods, dates.time_step)
-    result = pd.DataFrame({'ds': np.append(sample['ds'], future_ds), 'y_pred': prediction})
-    result = result[result['ds'].isin(np.append(sample['ds'], future_ds))]
+    result = prepare_result(sample, future_ds,  prediction)
 
     logging.debug(f'Обучение модели Хольта с сезонными коэффициентами завершено')
     logging.debug(f'Holt_time: {time() - start}')
@@ -526,15 +453,12 @@ def holt_predict(info,
     return result, {'holt': parameters}, None
 
 
-def holt_winters_predict(info,
-                         key,
-                         samples,
-                         mode,
-                         dates=None):
+def holt_winters_predict(info, key, samples, mode, dates=None):
     """
     Модель Хольта-Винтерса
 
     :param info: Именованный кортеж. Содержит информацию о параметрах прогнозирования;
+    :param key: Ключ пересечения;
     :param samples: Данные для прогнозирования;
     :param dates: Именованный кортеж. Содержит информацию о граничных датах;
     :param mode: Режим прогнозирования;
@@ -588,8 +512,7 @@ def holt_winters_predict(info,
 
     prediction, parameters = holt_winters(sample['y'], parameters['period'], parameters['trend'],
                                           parameters['seasonal'], dates.n_periods)
-    result = pd.DataFrame({'ds': np.append(sample['ds'], future_ds), 'y_pred': prediction})
-    result = result[result['ds'].isin(np.append(sample['ds'], future_ds))]
+    result = prepare_result(sample, future_ds,  prediction)
 
     logging.debug(f'Обучение модели Хольта-Винтерса завершено')
     logging.debug(f'Holt_Winter_time: {time() - start}')
@@ -597,15 +520,12 @@ def holt_winters_predict(info,
     return result, {'holt_winters': parameters}, None
 
 
-def linear_regression_predict(info,
-                              key,
-                              samples,
-                              mode,
-                              dates=None):
+def linear_regression_predict(info, key, samples, mode, dates=None):
     """
     Модель линейной регрессии
 
     :param info: Именованный кортеж. Содержит информацию о параметрах прогнозирования;
+    :param key: Ключ пересечения;
     :param samples: Данные для прогнозирования;
     :param dates: Именованный кортеж. Содержит информацию о граничных датах;
     :param mode: Режим прогнозирования;
@@ -621,8 +541,7 @@ def linear_regression_predict(info,
                               periods=dates.n_periods + 1)[1:]
 
     prediction = linear_regression(sample['ds'], sample['y'], dates.n_periods, dates.time_step)
-    result = pd.DataFrame({'ds': np.append(sample['ds'], future_ds), 'y_pred': prediction})
-    result = result[result['ds'].isin(np.append(sample['ds'], future_ds))]
+    result = prepare_result(sample, future_ds,  prediction)
 
     logging.debug(f'Обучение модели линейной регрессии завершено')
     logging.debug(f'Linear_Regression_time: {time() - start}')
@@ -630,15 +549,12 @@ def linear_regression_predict(info,
     return result, {}, None
 
 
-def polynomial_predict(info,
-                       key,
-                       samples,
-                       mode,
-                       dates=None):
+def polynomial_predict(info, key, samples, mode, dates=None):
     """
     Модель полиномиальной регрессии
 
     :param info: Именованный кортеж. Содержит информацию о параметрах прогнозирования;
+    :param key: Ключ пересечения;
     :param samples: Данные для прогнозирования;
     :param dates: Именованный кортеж. Содержит информацию о граничных датах;
     :param mode: Режим прогнозирования;
@@ -653,13 +569,12 @@ def polynomial_predict(info,
     min_degrees, max_degrees = dp_df['polynomial_min_degrees'], dp_df['polynomial_max_degrees']
     step = 1
     metric = dp_df['eval_metric'].get('polynomial', 'WAPE')
-
+    num_components = 0
     if mode == Mode.warm:
         num_components = info.forecast['specified_parameters'][key]['polynomial']['degree']
 
     if mode == Mode.cold:
         quality = np.inf
-        num_components = 0
 
         for degree in np.arange(start=min_degrees, stop=max_degrees + step, step=step):
             errors = []
@@ -685,8 +600,7 @@ def polynomial_predict(info,
                               periods=dates.n_periods + 1)[1:]
 
     prediction = polynomial_regression(sample['ds'], sample['y'], num_components, dates.n_periods, dates.time_step)
-    result = pd.DataFrame({'ds': np.append(sample['ds'], future_ds), 'y_pred': prediction})
-    result = result[result['ds'].isin(np.append(sample['ds'], future_ds))]
+    result = prepare_result(sample, future_ds,  prediction)
 
     logging.debug(f'Обучение модели полиномиальной регрессии завершено')
     logging.debug(f'Polynomial_time: {time() - start}')
@@ -694,15 +608,12 @@ def polynomial_predict(info,
     return result, {'polynomial': {'degree': num_components}}, None
 
 
-def theil_sen_predict(info,
-                      key,
-                      samples,
-                      mode,
-                      dates=None):
+def theil_sen_predict(info, key, samples, mode, dates=None):
     """
     Модель регрессии Тейла – Сена
 
     :param info: Именованный кортеж. Содержит информацию о параметрах прогнозирования;
+    :param key: Ключ пересечения;
     :param samples: Данные для прогнозирования;
     :param dates: Именованный кортеж. Содержит информацию о граничных датах;
     :param mode: Режим прогнозирования;
@@ -717,13 +628,12 @@ def theil_sen_predict(info,
     min_degrees, max_degrees = dp_df['theil_sen_min_degrees'], dp_df['theil_sen_max_degrees']
     step = 1
     metric = dp_df['eval_metric'].get('theil_sen', 'WAPE')
-
+    num_components = 0
     if mode == Mode.warm:
         num_components = info.forecast['specified_parameters'][key]['theil_sen']['degree']
 
     if mode == Mode.cold:
         quality = np.inf
-        num_components = 0
 
         for degree in np.arange(start=min_degrees, stop=max_degrees + step, step=step):
             errors = []
@@ -749,8 +659,7 @@ def theil_sen_predict(info,
                               periods=dates.n_periods + 1)[1:]
 
     prediction = theil_sen_regression(sample['ds'], sample['y'], num_components, dates.n_periods, dates.time_step)
-    result = pd.DataFrame({'ds': np.append(sample['ds'], future_ds), 'y_pred': prediction})
-    result = result[result['ds'].isin(np.append(sample['ds'], future_ds))]
+    result = prepare_result(sample, future_ds,  prediction)
 
     logging.debug(f'Обучение модели регрессии Тейла – Сена завершено')
     logging.debug(f'Theil_Sen_time: {time() - start}')
@@ -758,15 +667,12 @@ def theil_sen_predict(info,
     return result, {'theil_sen': {'degree': num_components}}, None
 
 
-def ransac_predict(info,
-                   key,
-                   samples,
-                   mode,
-                   dates=None):
+def ransac_predict(info, key, samples, mode, dates=None):
     """
     Модель регрессии консенсуса по случайной выборке (RANSAC)
 
     :param info: Именованный кортеж. Содержит информацию о параметрах прогнозирования;
+    :param key: Ключ пересечения;
     :param samples: Данные для прогнозирования;
     :param dates: Именованный кортеж. Содержит информацию о граничных датах;
     :param mode: Режим прогнозирования;
@@ -781,13 +687,12 @@ def ransac_predict(info,
     min_degrees, max_degrees = dp_df['ransac_min_degrees'], dp_df['ransac_max_degrees']
     step = 1
     metric = dp_df['eval_metric'].get('ransac', 'WAPE')
-
+    num_components = 0
     if mode == Mode.warm:
         num_components = info.forecast['specified_parameters'][key]['ransac']['degree']
 
     if mode == Mode.cold:
         quality = np.inf
-        num_components = 0
 
         for degree in np.arange(start=min_degrees, stop=max_degrees + step, step=step):
             errors = []
@@ -813,8 +718,7 @@ def ransac_predict(info,
                               periods=dates.n_periods + 1)[1:]
 
     prediction = ransac_regression(sample['ds'], sample['y'], num_components, dates.n_periods, dates.time_step)
-    result = pd.DataFrame({'ds': np.append(sample['ds'], future_ds), 'y_pred': prediction})
-    result = result[result['ds'].isin(np.append(sample['ds'], future_ds))]
+    result = prepare_result(sample, future_ds,  prediction)
 
     logging.debug(f'Обучение модели регрессии консенсуса по случайной выборке (RANSAC) завершено')
     logging.debug(f'ransac_time: {time() - start}')
@@ -822,15 +726,12 @@ def ransac_predict(info,
     return result, {'ransac': {'degree': num_components}}, None
 
 
-def huber_predict(info,
-                  key,
-                  samples,
-                  mode,
-                  dates=None):
+def huber_predict(info, key, samples, mode, dates=None):
     """
     Модель регрессии Хубера
 
     :param info: Именованный кортеж. Содержит информацию о параметрах прогнозирования;
+    :param key: Ключ пересечения;
     :param samples: Данные для прогнозирования;
     :param dates: Именованный кортеж. Содержит информацию о граничных датах;
     :param mode: Режим прогнозирования;
@@ -845,13 +746,12 @@ def huber_predict(info,
     min_degrees, max_degrees = dp_df['huber_min_degrees'], dp_df['huber_max_degrees']
     step = 1
     metric = dp_df['eval_metric'].get('huber', 'WAPE')
-
+    num_components = 0
     if mode == Mode.warm:
         num_components = info.forecast['specified_parameters'][key]['huber']['degree']
 
     if mode == Mode.cold:
         quality = np.inf
-        num_components = 0
 
         for degree in np.arange(start=min_degrees, stop=max_degrees + step, step=step):
             errors = []
@@ -877,8 +777,7 @@ def huber_predict(info,
                               periods=dates.n_periods + 1)[1:]
 
     prediction = huber_regression(sample['ds'], sample['y'], num_components, dates.n_periods, dates.time_step)
-    result = pd.DataFrame({'ds': np.append(sample['ds'], future_ds), 'y_pred': prediction})
-    result = result[result['ds'].isin(np.append(sample['ds'], future_ds))]
+    result = prepare_result(sample, future_ds,  prediction)
 
     logging.debug(f'Обучение модели регрессии Хубера завершено')
     logging.debug(f'Huber_time: {time() - start}')
@@ -886,15 +785,12 @@ def huber_predict(info,
     return result, {'huber': {'degree': num_components}}, None
 
 
-def lasso_predict(info,
-                  key,
-                  samples,
-                  mode,
-                  dates=None):
+def lasso_predict(info, key, samples, mode, dates=None):
     """
     Модель Лассо регрессии
 
     :param info: Именованный кортеж. Содержит информацию о параметрах прогнозирования;
+    :param key: Ключ пересечения;
     :param samples: Данные для прогнозирования;
     :param dates: Именованный кортеж. Содержит информацию о граничных датах;
     :param mode: Режим прогнозирования;
@@ -909,13 +805,12 @@ def lasso_predict(info,
     min_alpha, max_alpha = dp_df['lasso_min_alpha'], dp_df['lasso_max_alpha']
     step = dp_df['lasso_step']
     metric = dp_df['eval_metric'].get('lasso', 'WAPE')
-
+    num_components = 0
     if mode == Mode.warm:
         num_components = info.forecast['specified_parameters'][key]['lasso']['alpha']
 
     if mode == Mode.cold:
         quality = np.inf
-        num_components = 0
 
         for alpha in np.arange(start=min_alpha, stop=max_alpha + step, step=step):
             errors = []
@@ -941,8 +836,7 @@ def lasso_predict(info,
                               periods=dates.n_periods + 1)[1:]
 
     prediction = lasso_regression(sample['ds'], sample['y'], num_components, dates.n_periods, dates.time_step)
-    result = pd.DataFrame({'ds': np.append(sample['ds'], future_ds), 'y_pred': prediction})
-    result = result[result['ds'].isin(np.append(sample['ds'], future_ds))]
+    result = prepare_result(sample, future_ds,  prediction)
 
     logging.debug(f'Обучение модели Лассо регрессии завершено')
     logging.debug(f'lasso_time: {time() - start}')
@@ -950,15 +844,12 @@ def lasso_predict(info,
     return result, {'lasso': {'alpha': num_components}}, None
 
 
-def ridge_predict(info,
-                  key,
-                  samples,
-                  mode,
-                  dates=None):
+def ridge_predict(info, key, samples, mode, dates=None):
     """
     Модель Риджа регрессии
 
     :param info: Именованный кортеж. Содержит информацию о параметрах прогнозирования;
+    :param key: Ключ пересечения;
     :param samples: Данные для прогнозирования;
     :param dates: Именованный кортеж. Содержит информацию о граничных датах;
     :param mode: Режим прогнозирования;
@@ -974,13 +865,12 @@ def ridge_predict(info,
     min_alpha, max_alpha = dp_df['ridge_min_alpha'], dp_df['ridge_max_alpha']
     step = dp_df['ridge_step']
     metric = dp_df['eval_metric'].get('ridge', 'WAPE')
-
+    num_components = 0
     if mode == Mode.warm:
         num_components = info.forecast['specified_parameters'][key]['ridge']['alpha']
 
     if mode == Mode.cold:
         quality = np.inf
-        num_components = 0
 
         for alpha in np.arange(start=min_alpha, stop=max_alpha + step, step=step):
             errors = []
@@ -1006,8 +896,7 @@ def ridge_predict(info,
                               periods=dates.n_periods + 1)[1:]
 
     prediction = ridge_regression(sample['ds'], sample['y'], num_components, dates.n_periods, dates.time_step)
-    result = pd.DataFrame({'ds': np.append(sample['ds'], future_ds), 'y_pred': prediction})
-    result = result[result['ds'].isin(np.append(sample['ds'], future_ds))]
+    result = prepare_result(sample, future_ds,  prediction)
 
     logging.debug(f'Обучение модели Риджа регрессии завершено')
     logging.debug(f'ridge_time: {time() - start}')
@@ -1015,15 +904,12 @@ def ridge_predict(info,
     return result, {'ridge': {'alpha': num_components}}, None
 
 
-def elastic_net_predict(info,
-                        key,
-                        samples,
-                        mode,
-                        dates=None):
+def elastic_net_predict(info, key, samples, mode, dates=None):
     """
     Модель Elastic Net
 
     :param info: Именованный кортеж. Содержит информацию о параметрах прогнозирования;
+    :param key: Ключ пересечения;
     :param samples: Данные для прогнозирования;
     :param dates: Именованный кортеж. Содержит информацию о граничных датах;
     :param mode: Режим прогнозирования;
@@ -1074,8 +960,7 @@ def elastic_net_predict(info,
 
     prediction, parameters = elastic_net(sample['ds'], sample['y'], parameters['alpha'],
                                          parameters['l1_ratio'], dates.n_periods, dates.time_step)
-    result = pd.DataFrame({'ds': np.append(sample['ds'], future_ds), 'y_pred': prediction})
-    result = result[result['ds'].isin(np.append(sample['ds'], future_ds))]
+    result = prepare_result(sample, future_ds, prediction)
 
     logging.debug(f'Обучение модели Elastic Net завершено')
     logging.debug(f'elastic_net_time: {time() - start}')
@@ -1083,15 +968,12 @@ def elastic_net_predict(info,
     return result, {'elastic_net': parameters}, None
 
 
-def croston_tsb_predict(info,
-                        key,
-                        samples,
-                        mode,
-                        dates=None):
+def croston_tsb_predict(info, key, samples, mode, dates=None):
     """
     Модель Кростона TSB
 
     :param info: Именованный кортеж. Содержит информацию о параметрах прогнозирования;
+    :param key: Ключ пересечения;
     :param samples: Данные для прогнозирования;
     :param dates: Именованный кортеж. Содержит информацию о граничных датах;
     :param mode: Режим прогнозирования;
@@ -1107,6 +989,7 @@ def croston_tsb_predict(info,
     min_beta, max_beta = dp_df['croston_tsb_min_beta'], dp_df['croston_tsb_max_beta']
     step = dp_df['croston_tsb_step']
     metric = dp_df['eval_metric'].get('croston_tsb', 'WAPE')
+    temp_parameters = {}
 
     if mode == Mode.warm:
         parameters = info.forecast['specified_parameters'][key]['croston_tsb']
@@ -1142,8 +1025,7 @@ def croston_tsb_predict(info,
 
     prediction, fourier_parameters = croston_tsb(sample['ds'], sample['y'], parameters['alpha'],
                                                  parameters['beta'], dates.n_periods, dates.time_step)
-    result = pd.DataFrame({'ds': np.append(sample['ds'], future_ds), 'y_pred': prediction})
-    result = result[result['ds'].isin(np.append(sample['ds'], future_ds))]
+    result = prepare_result(sample, future_ds,  prediction)
 
     logging.debug(f'Обучение модели Кростона TSB завершено')
     logging.debug(f'croston_tsb_time: {time() - start}')
@@ -1151,15 +1033,12 @@ def croston_tsb_predict(info,
     return result, {'croston_tsb': parameters}, None
 
 
-def hyperbolic_predict(info,
-                       key,
-                       samples,
-                       mode,
-                       dates=None):
+def hyperbolic_predict(info, key, samples, mode, dates=None):
     """
     Модель гиперболической регрессии
 
     :param info: Именованный кортеж. Содержит информацию о параметрах прогнозирования;
+    :param key: Ключ пересечения;
     :param samples: Данные для прогнозирования;
     :param dates: Именованный кортеж. Содержит информацию о граничных датах;
     :param mode: Режим прогнозирования;
@@ -1175,8 +1054,7 @@ def hyperbolic_predict(info,
                               periods=dates.n_periods + 1)[1:]
 
     prediction = hyperbolic_regression(sample['ds'], sample['y'], dates.n_periods, dates.time_step)
-    result = pd.DataFrame({'ds': np.append(sample['ds'], future_ds), 'y_pred': prediction})
-    result = result[result['ds'].isin(np.append(sample['ds'], future_ds))]
+    result = prepare_result(sample, future_ds,  prediction)
 
     logging.debug(f'Обучение модели гиперболической регрессии завершено')
     logging.debug(f'hyperbolic_time: {time() - start}')
@@ -1184,11 +1062,7 @@ def hyperbolic_predict(info,
     return result, {}, None
 
 
-def const_predict(info,
-                  key,
-                  samples,
-                  mode,
-                  dates=None):
+def const_predict(info, key, samples, mode, dates=None):
     """
     Модель константного прогноза (мода)
 
@@ -1208,11 +1082,15 @@ def const_predict(info,
                               periods=dates.n_periods + 1)[1:]
 
     prediction = const(sample['y'], dates.n_periods)
-    result = pd.DataFrame({'ds': np.append(sample['ds'], future_ds), 'y_pred': prediction})
-    result = result[result['ds'].isin(np.append(sample['ds'], future_ds))]
+    result = prepare_result(sample, future_ds,  prediction)
+
 
     logging.debug(f'Обучение модели константного прогноза (мода) завершено')
     logging.debug(f'const_time: {time() - start}')
 
     return result, {}, None
 
+def prepare_result(sample, future_ds,  prediction):
+    result = pd.DataFrame({'ds': np.append(sample['ds'], future_ds), 'y_pred': prediction})
+    result = result[result['ds'].isin(np.append(sample['ds'], future_ds))]
+    return result
